@@ -469,7 +469,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Serve a local Devin session and quota dashboard.")
     parser.add_argument("--db", help="Path to Devin state.vscdb (auto-detected by default)")
     parser.add_argument("--cli-db", help="Path to Devin CLI sessions.db (auto-detected by default)")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--host", default="localhost", help="Bind address (default: localhost)")
     parser.add_argument("--port", type=int, default=8787, help="Starting port (default: 8787)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the dashboard automatically")
     args = parser.parse_args()

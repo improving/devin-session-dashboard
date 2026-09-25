@@ -16,7 +16,7 @@ Windows:
 py devin_dashboard.py
 ```
 
-The app opens `http://127.0.0.1:8787` automatically. Keep the terminal running while using the dashboard and press `Ctrl-C` to stop it.
+The app opens `http://localhost:8787` automatically. Keep the terminal running while using the dashboard and press `Ctrl-C` to stop it.
 
 Useful options:
 
@@ -70,7 +70,7 @@ Server-side, sessions whose title is `(untitled)` with zero user messages are hi
 
 ## Privacy and limitations
 
-- The server binds to `127.0.0.1` by default and serves no external assets.
+- The server binds to `localhost` by default and serves no external assets.
 - The app opens the SQLite database read-only and never reads `windsurfAuthStatus`, API keys, or credentials.
 - Per-session ACU, token usage, active runtime, and model generation time are read from the local Devin CLI session store (`~/.local/share/devin/cli/sessions.db`, override with `--cli-db`). Input and output tokens are summed from `metrics.input_tokens` and `metrics.output_tokens`; cached tokens combine `cache_read_tokens` and `cache_creation_tokens`. Duplicate message snapshots are deduplicated by message ID. Active runtime excludes gaps before user messages and caps any single gap at one hour; model generation time sums `metrics.total_time_ms`. Sessions without local CLI data (for example `devin-cloud` sessions) show `—`. The dollar amount is an estimate based on the price you enter.
 - Session conversation transcripts and tool details are not stored in the metadata records used by this dashboard.
