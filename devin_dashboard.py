@@ -140,6 +140,10 @@ def read_session_stats(db_path: Path | None, window_start: str | None = None, wi
                 contexts = read_session_contexts(conn)
             except sqlite3.Error:
                 contexts = {}
+            try:
+                user_messages = read_session_user_message_counts(conn)
+            except sqlite3.Error:
+                user_messages = {}
         finally:
             conn.close()
     except sqlite3.Error:
@@ -147,6 +151,8 @@ def read_session_stats(db_path: Path | None, window_start: str | None = None, wi
     stats: dict[str, dict[str, Any]] = {session_id: {"model": model} for session_id, model in models.items()}
     for session_id, context_tokens in contexts.items():
         stats.setdefault(str(session_id), {})["contextTokens"] = context_tokens
+    for session_id, message_count in user_messages.items():
+        stats.setdefault(str(session_id), {})["userMessages"] = message_count
     for session_id, acu, input_tokens, output_tokens, cached_tokens, gen_ms, runtime_ms, window_acu in rows:
         stats.setdefault(str(session_id), {}).update({
             "acu": float(acu) if isinstance(acu, (int, float)) else None,
@@ -158,6 +164,17 @@ def read_session_stats(db_path: Path | None, window_start: str | None = None, wi
             "genMs": float(gen_ms) if isinstance(gen_ms, (int, float)) else None,
         })
     return stats
+
+
+def read_session_user_message_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return the deduplicated number of user messages per session."""
+    rows = conn.execute("""
+        SELECT session_id, COUNT(DISTINCT json_extract(chat_message, '$.message_id'))
+        FROM message_nodes
+        WHERE json_extract(chat_message, '$.role') = 'user'
+        GROUP BY session_id
+    """).fetchall()
+    return {str(session_id): int(count) for session_id, count in rows if isinstance(count, (int, float))}
 
 
 def read_session_models(conn: sqlite3.Connection) -> dict[str, str]:
@@ -276,6 +293,35 @@ def billing_window_bounds(raw: dict[str, Any]) -> tuple[str | None, str | None]:
     return fmt(raw.get("startTimestamp", raw.get("planStart"))), fmt(raw.get("endTimestamp", raw.get("planEnd")))
 
 
+def read_sessions_table(db_path: Path) -> list[dict[str, Any]]:
+    """Return rows from the CLI sessions table (the session registry since the latest Devin update)."""
+    uri = f"file:{quote(str(db_path), safe="/:\\")}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            rows = conn.execute("""
+                SELECT id, title, working_directory, created_at, last_activity_at, hidden,
+                       json_extract(metadata, '$.total_acu_cost')
+                FROM sessions
+            """).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    sessions: list[dict[str, Any]] = []
+    for session_id, title, cwd, created_at, last_activity_at, hidden, meta_acu in rows:
+        sessions.append({
+            "slug": str(session_id),
+            "title": str(title).strip() if isinstance(title, str) and title.strip() else "(untitled)",
+            "cwd": str(cwd) if isinstance(cwd, str) else "",
+            "createdAt": created_at,
+            "updatedAt": last_activity_at,
+            "hidden": bool(hidden),
+            "metaAcu": float(meta_acu) if isinstance(meta_acu, (int, float)) else None,
+        })
+    return sessions
+
+
 def read_state(db_path: Path, cli_db_path: Path | None = None) -> dict[str, Any]:
     uri = f"file:{quote(str(db_path), safe="/:\\")}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
@@ -307,33 +353,30 @@ def read_state(db_path: Path, cli_db_path: Path | None = None) -> dict[str, Any]
     stats_by_session = read_session_stats(cli_db_path, window_start, window_end)
     plan["sessionAcu"] = sum(s["windowAcu"] for s in stats_by_session.values() if isinstance(s.get("windowAcu"), (int, float)))
     sessions: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-    for key, raw_value in session_rows:
-        value = safe_json(raw_value)
-        if not isinstance(value, dict):
-            continue
-        info = value.get("info") if isinstance(value.get("info"), dict) else {}
-        meta = info.get("_meta") if isinstance(info.get("_meta"), dict) else {}
-        session_id = str(info.get("sessionId") or session_id_from_key(key))
+    def append_session(session_id: str, slug: str, provider: str, title: str, cwd: str,
+                       created: Any, updated: Any, user_messages: Any,
+                       stats: dict[str, Any], fallback_acu: Any = None) -> None:
+        seen.add(session_id)
         workspace = workspaces.get(session_id)
         if not isinstance(workspace, dict):
             workspace = {}
-        created = meta.get("cognition.ai/createdAt") or starts.get(session_id)
-        user_messages = counts.get(session_id, meta.get("cognition.ai/userMessageCount"))
-        slug = session_id.rsplit("/", 1)[-1]
-        stats = stats_by_session.get(slug, {})
+        acu = stats.get("acu")
+        if not isinstance(acu, (int, float)):
+            acu = fallback_acu
         sessions.append({
             "id": session_id,
             "slug": slug,
-            "provider": extract_provider(session_id, value.get("providerId")),
-            "title": str(info.get("title") or "(untitled)"),
-            "cwd": str(info.get("cwd") or ""),
-            "workspace": workspace_name(workspace, str(info.get("cwd") or "")),
+            "provider": provider,
+            "title": title,
+            "cwd": cwd,
+            "workspace": workspace_name(workspace, cwd),
             "model": stats.get("model"),
             "createdAt": iso_value(created),
-            "updatedAt": iso_value(info.get("updatedAt")),
+            "updatedAt": iso_value(updated),
             "messages": int(user_messages) if isinstance(user_messages, (int, float)) else 0,
-            "acu": stats.get("acu"),
+            "acu": acu,
             "runtimeMs": stats.get("runtimeMs"),
             "genMs": stats.get("genMs"),
             "inputTokens": stats.get("inputTokens"),
@@ -341,6 +384,47 @@ def read_state(db_path: Path, cli_db_path: Path | None = None) -> dict[str, Any]
             "cachedTokens": stats.get("cachedTokens"),
             "contextTokens": stats.get("contextTokens"),
         })
+
+    # Primary source since the latest Devin update: the CLI sessions table.
+    if cli_db_path is not None:
+        for row in read_sessions_table(cli_db_path):
+            if row["hidden"]:
+                continue
+            slug = row["slug"]
+            session_id = f"acp/devin-cli/{slug}"
+            stats = stats_by_session.get(slug, {})
+            user_messages = stats.get("userMessages")
+            if not isinstance(user_messages, (int, float)):
+                user_messages = counts.get(session_id, 0)
+            append_session(session_id, slug, "devin-cli", row["title"], row["cwd"],
+                           row["createdAt"], row["updatedAt"], user_messages,
+                           stats, fallback_acu=row["metaAcu"])
+
+    # Legacy source kept for older Devin builds: windsurf.acp.sessioninfo.* entries.
+    for key, raw_value in session_rows:
+        value = safe_json(raw_value)
+        if not isinstance(value, dict):
+            continue
+        info = value.get("info") if isinstance(value.get("info"), dict) else {}
+        meta = info.get("_meta") if isinstance(info.get("_meta"), dict) else {}
+        session_id = str(info.get("sessionId") or session_id_from_key(key))
+        if session_id in seen:
+            continue
+        created = meta.get("cognition.ai/createdAt") or starts.get(session_id)
+        user_messages = counts.get(session_id, meta.get("cognition.ai/userMessageCount"))
+        slug = session_id.rsplit("/", 1)[-1]
+        append_session(session_id, slug, extract_provider(session_id, value.get("providerId")),
+                       str(info.get("title") or "(untitled)"), str(info.get("cwd") or ""),
+                       created, info.get("updatedAt"), user_messages, stats_by_session.get(slug, {}))
+
+    # Sessions only known via start-time/message-count keys (e.g. devin-cloud).
+    for session_id in set(starts) | set(counts):
+        if session_id in seen:
+            continue
+        slug = session_id.rsplit("/", 1)[-1]
+        append_session(session_id, slug, extract_provider(session_id, None), "(untitled)", "",
+                       starts.get(session_id), None, counts.get(session_id),
+                       stats_by_session.get(slug, {}))
 
     total_sessions = len(sessions)
     sessions = [s for s in sessions if s["title"] != "(untitled)" or s["messages"] > 0]
